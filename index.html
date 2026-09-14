@@ -707,12 +707,12 @@
         </section>
 
         <section class="panel-section">
-          <div class="section-kicker"><span>智能精细切格</span><span class="step-dot" aria-hidden="true"></span></div>
+          <div class="section-kicker"><span>智能自适应切格</span><span class="step-dot" aria-hidden="true"></span></div>
           <div class="auto-grid-card">
             <span class="auto-grid-icon">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="3"></rect><path d="M9 3v18M15 3v18M3 9h18M3 15h18"></path><path d="m17.5 5.5.7 1.4 1.4.7-1.4.7-.7 1.4-.7-1.4-1.4-.7 1.4-.7z" fill="currentColor" stroke="none"></path></svg>
             </span>
-            <div><strong>自动识别，无需填写行列</strong><p>普通大图保留约 120–160 格长边；每 10 格粗分区，每 5 格浅分隔。</p></div>
+            <div><strong>自动识别，无需填写行列</strong><p>原网格保持不变；普通图按尺寸与复杂度自适应，只有大而复杂时才精细切分。</p></div>
           </div>
           <div class="auto-flow" aria-hidden="true">
             <span>识别</span><span class="flow-arrow">→</span><span>切格</span><span class="flow-arrow">→</span><span>匹配</span>
@@ -976,6 +976,7 @@
       palette: "221",
       gridMode: "waiting",
       gridConfidence: 0,
+      gridBounds: null,
       activeColorCode: null,
       rawColorCount: 0,
       mergedColorCount: 0,
@@ -1265,13 +1266,100 @@
         const ratio = best.lag / item.lag;
         const integerRatio = Math.round(ratio);
         return integerRatio >= 2 && integerRatio <= 12 && Math.abs(ratio - integerRatio) <= 0.10
-          && item.combScore >= Math.max(0.34, best.combScore * 0.55)
-          && item.score >= best.score * 0.46
-          && item.correlation > 0.04;
+          && item.combScore >= Math.max(0.20, best.combScore * 0.25)
+          && item.score >= best.score * 0.55
+          && item.correlation > 0.08;
       }).sort((a, b) => a.lag - b.lag);
       if (harmonicCandidates.length) best = harmonicCandidates[0];
       const harmonicConfidence = dominant === best ? best.score : dominant.score * Math.min(1, best.combScore / Math.max(0.01, dominant.combScore));
       return {period: best.lag, confidence: Math.max(best.score, harmonicConfidence), correlation: best.correlation, peak: best.combScore};
+    }
+
+    // 找出周期线真正覆盖的区域。这样上传带留白或外框的网格截图时，
+    // 会沿用内部原网格，而不是把整张截图重新按普通图片切一遍。
+    function locateGridSpan(values, period) {
+      const length = values.length;
+      const usable = values.slice(2, -2);
+      const mean = usable.reduce((sum, value) => sum + value, 0) / Math.max(1, usable.length);
+      const variance = usable.reduce((sum, value) => sum + Math.pow(value - mean, 2), 0) / Math.max(1, usable.length);
+      const deviation = Math.sqrt(variance);
+      if (!Number.isFinite(deviation) || deviation < 1.8) return null;
+      const normalized = values.map(value => (value - mean) / deviation);
+      const radius = Math.max(1, Math.min(3, Math.round(period * 0.10)));
+      const localPeak = position => {
+        let score = -Infinity, peakPosition = position;
+        for (let delta = -radius; delta <= radius; delta++) {
+          const candidate = position + delta;
+          if (candidate < 2 || candidate >= length - 2) continue;
+          if (normalized[candidate] > score) {
+            score = normalized[candidate];
+            peakPosition = candidate;
+          }
+        }
+        return {position: peakPosition, score};
+      };
+
+      let bestPhase = 0, bestPhaseScore = -Infinity;
+      for (let phase = 0; phase < period; phase++) {
+        const scores = [];
+        for (let position = phase; position < length; position += period) {
+          const peak = localPeak(position);
+          if (Number.isFinite(peak.score)) scores.push(Math.max(0, peak.score));
+        }
+        if (scores.length < 5) continue;
+        scores.sort((a, b) => b - a);
+        const keep = Math.max(4, Math.ceil(scores.length * 0.65));
+        const phaseScore = scores.slice(0, keep).reduce((sum, score) => sum + score, 0) / keep;
+        if (phaseScore > bestPhaseScore) {
+          bestPhase = phase;
+          bestPhaseScore = phaseScore;
+        }
+      }
+      if (!Number.isFinite(bestPhaseScore) || bestPhaseScore < 0.45) return null;
+
+      const lines = [];
+      for (let position = bestPhase; position < length; position += period) {
+        const peak = localPeak(position);
+        if (Number.isFinite(peak.score)) lines.push(peak);
+      }
+      const threshold = Math.max(0.38, bestPhaseScore * 0.24);
+      let winner = null;
+      for (let startIndex = 0; startIndex < lines.length - 4; startIndex++) {
+        if (lines[startIndex].score < threshold) continue;
+        let strong = 1;
+        let positiveSum = Math.max(0, lines[startIndex].score);
+        for (let endIndex = startIndex + 1; endIndex < lines.length; endIndex++) {
+          const score = lines[endIndex].score;
+          if (score >= threshold) strong++;
+          positiveSum += Math.max(0, score);
+          const cells = endIndex - startIndex;
+          if (cells < 4 || score < threshold) continue;
+          const lineCount = cells + 1;
+          const strongRatio = strong / lineCount;
+          const averageScore = positiveSum / lineCount;
+          const start = lines[startIndex].position;
+          const end = lines[endIndex].position;
+          const coverage = (end - start) / Math.max(1, length - 1);
+          if (strongRatio < 0.58 || averageScore < 0.44 || coverage < 0.45) continue;
+          const rank = cells * 10 + strongRatio + Math.min(2, averageScore) * 0.1;
+          if (!winner || rank > winner.rank) winner = {start, end, cells, strongRatio, coverage, rank};
+        }
+      }
+      if (!winner) return null;
+      // 外侧边线偶尔会被圆角边框或阴影削弱；仅在剩余空间刚好还能容纳一格时补齐，
+      // 避免把截图四周的留白误算成新的格子。
+      let {start, end, cells} = winner;
+      const leadingGap = start;
+      const trailingGap = length - 1 - end;
+      if (leadingGap > period * 0.90 && leadingGap < period * 1.90) {
+        start = Math.max(0, start - period);
+        cells++;
+      }
+      if (trailingGap > period * 0.90 && trailingGap < period * 1.90) {
+        end = Math.min(length - 1, end + period);
+        cells++;
+      }
+      return {...winner, start, end, cells};
     }
 
     function estimateDetailGrid(canvas) {
@@ -1291,13 +1379,13 @@
         }
       }
       const edgeDensity = samples ? difference / (samples * 255) : 0;
-      const detail = Math.max(0, Math.min(1, (edgeDensity - 0.025) / 0.16));
-      // 普通图片不能沿用过去 34–60 格的低分辨率，否则人物和场景轮廓会被大块色面吞掉。
-      // 同时参考源图尺寸与边缘密度：高清图长边约 128–160 格，较小图片约 80–112 格。
+      // 分辨率和画面复杂度共同决定格数：小而简单的图保持轻量，
+      // 只有高分辨率且细节丰富时才进入 120–160 格的精细区间。
       const longEdge = Math.max(width, height);
-      const resolutionWeight = Math.max(0, Math.min(1, (longEdge - 640) / 1160));
-      let longSideCells = Math.round(80 + resolutionWeight * 48 + detail * 32);
-      longSideCells = Math.max(72, Math.min(160, longSideCells));
+      const resolutionWeight = Math.max(0, Math.min(1, (longEdge - 480) / 1320));
+      const complexityWeight = Math.max(0, Math.min(1, (edgeDensity - 0.020) / 0.075));
+      let longSideCells = Math.round(34 + resolutionWeight * 20 + complexityWeight * 32 + resolutionWeight * complexityWeight * 100);
+      longSideCells = Math.max(28, Math.min(160, longSideCells));
       let cols, rows;
       if (width >= height) {
         cols = longSideCells;
@@ -1317,29 +1405,37 @@
 
     function detectAutomaticGrid(sourceCanvas) {
       const analysis = createAnalysisCanvas(sourceCanvas);
-      const xPeriod = detectAxisPeriod(edgeProjection(analysis, "x"));
-      const yPeriod = detectAxisPeriod(edgeProjection(analysis, "y"));
-      const validX = xPeriod && xPeriod.confidence >= 0.42;
-      const validY = yPeriod && yPeriod.confidence >= 0.42;
+      const xProjection = edgeProjection(analysis, "x");
+      const yProjection = edgeProjection(analysis, "y");
+      const xPeriod = detectAxisPeriod(xProjection);
+      const yPeriod = detectAxisPeriod(yProjection);
+      const validX = xPeriod && xPeriod.confidence >= 0.22 && xPeriod.peak >= 0.20;
+      const validY = yPeriod && yPeriod.confidence >= 0.22 && yPeriod.peak >= 0.20;
       let cols = 0, rows = 0, confidence = 0;
       if (validX && validY) {
         const periodRatio = Math.max(xPeriod.period / yPeriod.period, yPeriod.period / xPeriod.period);
         if (periodRatio <= 1.38) {
-          cols = Math.round(analysis.width / xPeriod.period);
-          rows = Math.round(analysis.height / yPeriod.period);
-          confidence = (xPeriod.confidence + yPeriod.confidence) / 2;
+          const xSpan = locateGridSpan(xProjection, xPeriod.period);
+          const ySpan = locateGridSpan(yProjection, yPeriod.period);
+          if (xSpan && ySpan) {
+            cols = xSpan.cells;
+            rows = ySpan.cells;
+            confidence = (xPeriod.confidence + yPeriod.confidence + xSpan.strongRatio + ySpan.strongRatio) / 4;
+            if (cols >= 4 && rows >= 4 && cols <= 200 && rows <= 200) {
+              const scaleX = sourceCanvas.width / analysis.width;
+              const scaleY = sourceCanvas.height / analysis.height;
+              return {
+                cols, rows, mode: "detected", confidence, xPeriod, yPeriod,
+                bounds: {
+                  left: Math.max(0, Math.round(xSpan.start * scaleX)),
+                  top: Math.max(0, Math.round(ySpan.start * scaleY)),
+                  right: Math.min(sourceCanvas.width, Math.round(xSpan.end * scaleX)),
+                  bottom: Math.min(sourceCanvas.height, Math.round(ySpan.end * scaleY))
+                }
+              };
+            }
+          }
         }
-      } else if (validX && xPeriod.confidence >= 0.62) {
-        cols = Math.round(analysis.width / xPeriod.period);
-        rows = Math.round(analysis.height / xPeriod.period);
-        confidence = xPeriod.confidence * 0.86;
-      } else if (validY && yPeriod.confidence >= 0.62) {
-        cols = Math.round(analysis.width / yPeriod.period);
-        rows = Math.round(analysis.height / yPeriod.period);
-        confidence = yPeriod.confidence * 0.86;
-      }
-      if (cols >= 4 && rows >= 4 && cols <= 200 && rows <= 200) {
-        return {cols, rows, mode: "detected", confidence, xPeriod, yPeriod};
       }
       // 网格检测可以使用缩略图，但普通图片的输出密度必须依据工作原图，
       // 否则高清图片会因为检测阶段的缩放再次被切得过粗。
@@ -1351,10 +1447,13 @@
       const ctx = canvas.getContext("2d", {willReadFrequently: true});
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
       const cells = [];
+      const bounds = state.gridBounds || {left: 0, top: 0, right: canvas.width, bottom: canvas.height};
+      const sampleWidth = Math.max(1, bounds.right - bounds.left);
+      const sampleHeight = Math.max(1, bounds.bottom - bounds.top);
       for (let row = 0; row < state.rows; row++) {
-        const y = Math.min(canvas.height - 1, Math.floor((row + 0.5) * canvas.height / state.rows));
+        const y = Math.min(canvas.height - 1, Math.floor(bounds.top + (row + 0.5) * sampleHeight / state.rows));
         for (let col = 0; col < state.cols; col++) {
-          const x = Math.min(canvas.width - 1, Math.floor((col + 0.5) * canvas.width / state.cols));
+          const x = Math.min(canvas.width - 1, Math.floor(bounds.left + (col + 0.5) * sampleWidth / state.cols));
           const offset = (y * canvas.width + x) * 4;
           const r = imageData[offset], g = imageData[offset + 1], b = imageData[offset + 2];
           cells.push({r, g, b, hex: rgbToHex(r,g,b), lab: rgbToLab(r,g,b)});
@@ -1429,6 +1528,7 @@
             state.rows = grid.rows;
             state.gridMode = grid.mode;
             state.gridConfidence = grid.confidence;
+            state.gridBounds = grid.bounds || null;
             sampleSourceCells();
           }
           rematchColors();
@@ -1437,7 +1537,7 @@
           setResultActions(true);
           const downsampled = state.originalSize && (state.originalSize.width !== state.sourceCanvas.width || state.originalSize.height !== state.sourceCanvas.height);
           const detail = downsampled ? ` · 已从 ${state.originalSize.width}×${state.originalSize.height} 安全降采样` : "";
-          const gridMessage = state.gridMode === "detected" ? `检测到原始网格 ${state.cols}×${state.rows}` : `普通图片已精细切分 ${state.cols}×${state.rows}`;
+          const gridMessage = state.gridMode === "detected" ? `已沿用原始网格 ${state.cols}×${state.rows}` : `普通图片已自适应切分 ${state.cols}×${state.rows}`;
           const largeGridHint = isLargeGrid() ? " · 大图可点击右侧色号定位" : " · 格内已显示色号";
           const simplifyHint = state.mergedColorCount ? ` · 已精简 ${state.mergedColorCount} 个近似色号` : "";
           setStatus(state.sourceName, `${gridMessage} · ${state.palette} 色模式${simplifyHint}${largeGridHint}${detail}`, true);

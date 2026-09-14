@@ -1454,8 +1454,56 @@
       return best && best.score >= 0.42 ? best : null;
     }
 
+    // 显式网格线检测：同时识别细线和每 5/10 格的粗计数线。
+    // 评分重点是“整幅图上是否连续出现”，而不是哪一种线最黑，因此不会再把粗线间距当成单格。
+    function detectExplicitGridAxis(values) {
+      const usable = values.slice(2, -2);
+      const mean = usable.reduce((sum, value) => sum + value, 0) / Math.max(1, usable.length);
+      const variance = usable.reduce((sum, value) => sum + Math.pow(value - mean, 2), 0) / Math.max(1, usable.length);
+      const deviation = Math.sqrt(variance);
+      if (!Number.isFinite(deviation) || deviation < 1.8) return null;
+      const normalized = values.map(value => (value - mean) / deviation);
+      const length = values.length;
+      let best = null;
+      for (let period = 4; period <= Math.min(80, length / 12); period += 0.25) {
+        const expectedLines = Math.floor(length / period) + 1;
+        if (expectedLines < 13) continue;
+        for (let phase = 0; phase < period; phase += 0.5) {
+          const scores = [];
+          for (let position = phase; position < length; position += period) {
+            let peak = -Infinity;
+            for (let delta = -2; delta <= 2; delta++) {
+              const index = Math.round(position + delta);
+              if (index >= 1 && index < length - 1) peak = Math.max(peak, normalized[index]);
+            }
+            if (Number.isFinite(peak)) scores.push(peak);
+          }
+          if (scores.length < 13) continue;
+          const strongRatio = scores.filter(score => score >= 0.32).length / scores.length;
+          const average = scores.reduce((sum, score) => sum + Math.max(0, Math.min(3, score)), 0) / scores.length;
+          if (strongRatio < 0.68 || average < 0.42) continue;
+          const lineReward = Math.min(1, scores.length / 38);
+          const score = strongRatio * 0.58 + Math.min(1, average / 1.8) * 0.27 + lineReward * 0.15;
+          if (!best || score > best.score + 0.012 || (Math.abs(score - best.score) <= 0.012 && period < best.period)) {
+            best = {period, phase, score, lineCount: scores.length};
+          }
+        }
+      }
+      return best && best.score >= 0.58 ? best : null;
+    }
+
     function detectAutomaticGrid(sourceCanvas) {
       const analysis = createAnalysisCanvas(sourceCanvas);
+      const explicitX = detectExplicitGridAxis(edgeProjection(analysis, "x"));
+      const explicitY = detectExplicitGridAxis(edgeProjection(analysis, "y"));
+      if (explicitX && explicitY) {
+        const periodRatio = Math.max(explicitX.period / explicitY.period, explicitY.period / explicitX.period);
+        const cols = Math.round(analysis.width / explicitX.period);
+        const rows = Math.round(analysis.height / explicitY.period);
+        if (periodRatio <= 1.18 && cols >= 12 && rows >= 12 && cols <= 200 && rows <= 200) {
+          return {cols, rows, mode: "detected", confidence: (explicitX.score + explicitY.score) / 2, bounds: null};
+        }
+      }
       const latticeX = detectPixelLattice(analysis, "x");
       const latticeY = detectPixelLattice(analysis, "y");
       if (latticeX && latticeY) {
@@ -1553,7 +1601,9 @@
       for (const code of codesByRarity) {
         if (!activeCounts.has(code)) continue;
         const count = activeCounts.get(code);
-        const threshold = count <= rareLimit ? 8.5 : 3.2;
+        // 拼豆材料的实际观感不需要保留显示器级别的细微色差：
+        // 常用色在 ΔE 4.8 内合并，少量 JPEG 噪声色允许放宽到 10，兼顾层次与可操作性。
+        const threshold = count <= rareLimit ? 10 : 4.8;
         let bestCode = null;
         let bestDistance = Infinity;
         for (const [candidateCode, candidateCount] of activeCounts) {
@@ -1678,13 +1728,10 @@
     function loadImageSource(src, name) {
       const image = new Image();
       image.onload = () => {
-        const MAX_EDGE = 1800;
-        const MAX_PIXELS = 2600000;
-        const pixelScale = Math.sqrt(MAX_PIXELS / (image.naturalWidth * image.naturalHeight));
-        const scale = Math.min(1, MAX_EDGE / image.naturalWidth, MAX_EDGE / image.naturalHeight, pixelScale);
         const canvas = document.createElement("canvas");
-        canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
-        canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+        // 工作原图保持用户上传的真实像素尺寸；仅 detectAutomaticGrid 内部可创建分析缩略图。
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
         const ctx = canvas.getContext("2d", {alpha: false});
         // 保留放大像素画的硬边；普通照片后续会在每格内做多点平均，不依赖这里的插值模糊。
         ctx.imageSmoothingEnabled = false;
